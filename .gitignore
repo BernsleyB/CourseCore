@@ -1,0 +1,15 @@
+# Sensitive credentials — never commit these
+canvas_config.json
+
+# Personal academic data
+assignments.json
+
+# Log files from the launchd notification service
+*.log
+
+# macOS system files
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
