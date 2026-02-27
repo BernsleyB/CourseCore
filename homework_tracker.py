@@ -16,6 +16,8 @@ from datetime import date
 import datetime as _dt
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
+import urllib.request
+import urllib.error
 
 
 # ── Paths & config ────────────────────────────────────────────────────────────
@@ -67,6 +69,73 @@ def start_canvas_sync():
     if _sync_state["running"]:
         return
     threading.Thread(target=_do_canvas_sync, daemon=True).start()
+
+
+# ── Anthropic AI summarization ────────────────────────────────────────────────
+
+def _call_anthropic(api_key: str, assignment: dict) -> dict:
+    """Call Anthropic API to summarize an assignment. Returns dict with three fields."""
+    title    = assignment.get("title",    "Unknown Assignment")
+    course   = assignment.get("course",   "Unknown Course")
+    due_date = assignment.get("due_date", "Unknown")
+
+    prompt = (
+        "You are a helpful academic assistant for a nursing/science student at "
+        "Palm Beach State College.\n\n"
+        f"Assignment: {title}\n"
+        f"Course: {course}\n"
+        f"Due Date: {due_date}\n\n"
+        "Based on the assignment title and course, respond with a JSON object "
+        "containing exactly these three keys:\n"
+        "- \"what_its_asking\": What this assignment is likely asking the student "
+        "to do (1-3 sentences)\n"
+        "- \"concepts_tested\": The academic concepts or skills this assignment "
+        "probably tests (1-3 sentences)\n"
+        "- \"suggested_approach\": A practical suggested approach for completing "
+        "this assignment (2-4 sentences)\n\n"
+        "Respond with only valid JSON — no markdown fences, no extra text."
+    )
+
+    payload = json.dumps({
+        "model":      "claude-sonnet-4-20250514",
+        "max_tokens": 1024,
+        "messages":   [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload, method="POST",
+    )
+    req.add_header("Content-Type",      "application/json")
+    req.add_header("x-api-key",         api_key)
+    req.add_header("anthropic-version", "2023-06-01")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+            text   = result["content"][0]["text"].strip()
+            # Strip markdown fences in case they appear anyway
+            if text.startswith("```"):
+                parts = text.split("```")
+                text = parts[1] if len(parts) > 1 else text
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {
+                    "what_its_asking":    text,
+                    "concepts_tested":    "",
+                    "suggested_approach": "",
+                }
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            msg = json.loads(body).get("error", {}).get("message", body)
+        except Exception:
+            msg = body
+        raise Exception(f"Anthropic API error ({e.code}): {msg}")
 
 
 # ── Embedded HTML/CSS/JS ──────────────────────────────────────────────────────
@@ -126,7 +195,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   .col-headers {
     display: grid;
-    grid-template-columns: 32px 2fr 1.3fr 1fr 1.1fr 44px;
+    grid-template-columns: 32px 2fr 1.3fr 1fr 1.1fr 36px 44px;
     padding: 8px 16px;
     background: #dde4ef;
     border-radius: 10px 10px 0 0;
@@ -140,7 +209,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   /* ── Rows ── */
   .row {
     display: grid;
-    grid-template-columns: 32px 2fr 1.3fr 1fr 1.1fr 44px;
+    grid-template-columns: 32px 2fr 1.3fr 1fr 1.1fr 36px 44px;
     padding: 13px 16px;
     align-items: center;
     border-bottom: 1px solid rgba(0,0,0,0.06);
@@ -341,6 +410,69 @@ HTML_PAGE = r"""<!DOCTYPE html>
     letter-spacing: 0.04em; margin-left: 6px;
     vertical-align: middle; line-height: 1.4;
   }
+
+  /* ── AI Summarize button ── */
+  .btn-summarize {
+    background: transparent; border: none;
+    color: #a5b4fc; font-size: 15px;
+    cursor: pointer; padding: 4px 6px; border-radius: 6px;
+    line-height: 1; transition: color 0.15s, background 0.15s;
+    justify-self: end;
+  }
+  .btn-summarize:hover { color: #4f46e5; background: rgba(79,70,229,0.1); }
+
+  /* ── Summary modal ── */
+  .summary-modal {
+    background: white; border-radius: 16px; overflow: hidden;
+    width: 100%; max-width: 560px;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.35);
+    animation: pop-in 0.18s ease;
+  }
+  .summary-hdr {
+    background: #4338ca; color: white;
+    padding: 15px 20px;
+    display: flex; justify-content: space-between; align-items: flex-start;
+  }
+  .summary-hdr-title    { font-size: 16px; font-weight: 700; }
+  .summary-hdr-subtitle { font-size: 12px; opacity: 0.75; margin-top: 3px; }
+  .summary-close {
+    background: rgba(255,255,255,0.15); border: none; color: white;
+    width: 28px; height: 28px; border-radius: 6px; flex-shrink: 0;
+    font-size: 16px; cursor: pointer; font-family: inherit;
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s; margin-left: 12px;
+  }
+  .summary-close:hover { background: rgba(255,255,255,0.28); }
+
+  .summary-body { padding: 20px; max-height: 70vh; overflow-y: auto; }
+  .summary-loading {
+    text-align: center; padding: 40px 20px; color: #64748b;
+  }
+  .summary-loading .spin-icon {
+    font-size: 28px; margin-bottom: 12px;
+    display: inline-block;
+    animation: spin-anim 1s linear infinite;
+  }
+  @keyframes spin-anim {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+  .summary-section { margin-bottom: 16px; }
+  .summary-section:last-child { margin-bottom: 0; }
+  .summary-section-label {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.07em; color: #4338ca; margin-bottom: 6px;
+  }
+  .summary-section-text {
+    font-size: 14px; color: #1e293b; line-height: 1.6;
+    background: #f8fafc; border-radius: 8px; padding: 10px 14px;
+    border-left: 3px solid #c7d2fe;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .summary-error {
+    background: #fef2f2; color: #dc2626;
+    border-radius: 8px; padding: 14px; font-size: 14px;
+  }
 </style>
 </head>
 <body>
@@ -373,6 +505,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span>Due Date</span>
     <span>Status</span>
     <span></span>
+    <span></span>
   </div>
   <div class="rows" id="rows">
     <div class="empty"><h2>No assignments yet!</h2><p>Click '+ Add Assignment' to get started.</p></div>
@@ -380,7 +513,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 </div>
 
-<!-- Modal -->
+<!-- Summary Modal -->
+<div class="overlay" id="summary-overlay" onclick="summaryOverlayClick(event)">
+  <div class="summary-modal">
+    <div class="summary-hdr">
+      <div>
+        <div class="summary-hdr-title"  id="summary-modal-title">AI Summary</div>
+        <div class="summary-hdr-subtitle" id="summary-modal-course"></div>
+      </div>
+      <button class="summary-close" onclick="closeSummaryModal()">&#x2715;</button>
+    </div>
+    <div class="summary-body" id="summary-body"></div>
+  </div>
+</div>
+
+<!-- Add Assignment Modal -->
 <div class="overlay" id="overlay" onclick="overlayClick(event)">
   <div class="modal">
     <div class="modal-hdr">Add New Assignment</div>
@@ -456,7 +603,7 @@ function closeModal() {
 function overlayClick(e) { if (e.target.id === 'overlay') closeModal(); }
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Escape') { closeModal(); closeSummaryModal(); }
   if (e.key === 'Enter' && document.getElementById('overlay').classList.contains('open'))
     saveAssignment();
 });
@@ -582,6 +729,7 @@ function renderRow(a, today) {
     <span class="course">${safeC}${badge}</span>
     <span class="due">${fmt}</span>
     <span class="status ${statusClass}">${statusLabel}</span>
+    <button class="btn-summarize" onclick="summarize('${esc(a.id)}')" title="AI Summary">&#x2726;</button>
     <button class="btn-delete" onclick="del('${esc(a.id)}','${safeT}')" title="Delete">&#x2715;</button>
   </div>`;
 }
@@ -676,6 +824,55 @@ async function pollSyncStatus() {
   } catch(e) { /* server may still be starting */ }
 }
 
+// ── AI Summarize ────────────────────────────────────────────────────────────
+function closeSummaryModal() {
+  document.getElementById('summary-overlay').classList.remove('open');
+}
+function summaryOverlayClick(e) {
+  if (e.target.id === 'summary-overlay') closeSummaryModal();
+}
+
+async function summarize(id) {
+  document.getElementById('summary-modal-title').textContent  = 'Analyzing\u2026';
+  document.getElementById('summary-modal-course').textContent = '';
+  document.getElementById('summary-body').innerHTML =
+    '<div class="summary-loading">' +
+    '<div class="spin-icon">\u27F3</div>' +
+    '<p>Asking Claude to analyze this assignment\u2026</p></div>';
+  document.getElementById('summary-overlay').classList.add('open');
+
+  try {
+    const resp = await fetch('/api/summarize/' + id, { method: 'POST' });
+    const data = await resp.json();
+    const body = document.getElementById('summary-body');
+
+    if (!resp.ok || data.error) {
+      body.innerHTML = '<div class="summary-error">' + esc(data.error || 'Unknown error') + '</div>';
+      return;
+    }
+
+    document.getElementById('summary-modal-title').textContent  = data.title  || 'AI Summary';
+    document.getElementById('summary-modal-course').textContent = data.course || '';
+
+    body.innerHTML =
+      '<div class="summary-section">' +
+        '<div class="summary-section-label">What it\'s asking for</div>' +
+        '<div class="summary-section-text">' + esc(data.what_its_asking    || '') + '</div>' +
+      '</div>' +
+      '<div class="summary-section">' +
+        '<div class="summary-section-label">Concepts being tested</div>' +
+        '<div class="summary-section-text">' + esc(data.concepts_tested    || '') + '</div>' +
+      '</div>' +
+      '<div class="summary-section">' +
+        '<div class="summary-section-label">Suggested approach</div>' +
+        '<div class="summary-section-text">' + esc(data.suggested_approach || '') + '</div>' +
+      '</div>';
+  } catch(e) {
+    document.getElementById('summary-body').innerHTML =
+      '<div class="summary-error">Network error \u2014 could not reach server.</div>';
+  }
+}
+
 initDates();
 loadAssignments();
 pollSyncStatus();                        // kick off on page load
@@ -752,6 +949,44 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True})
             except Exception as err:
                 self._send_json({"error": str(err)}, 400)
+        elif path.startswith("/api/summarize/"):
+            aid        = path[len("/api/summarize/"):]
+            assignments = load_assignments()
+            assignment  = next((a for a in assignments if a["id"] == aid), None)
+            if assignment is None:
+                self._send_json({"error": "Assignment not found."}, 404)
+                return
+
+            config_path = os.path.join(SCRIPT_DIR, "canvas_config.json")
+            try:
+                with open(config_path) as f:
+                    config = json.load(f)
+            except (IOError, json.JSONDecodeError):
+                self._send_json(
+                    {"error": "canvas_config.json not found or invalid. "
+                              "Add your anthropic_key to it."}, 500)
+                return
+
+            api_key = config.get("anthropic_key", "").strip()
+            if not api_key:
+                self._send_json(
+                    {"error": "No Anthropic API key configured. "
+                              "Add \"anthropic_key\": \"<your-key>\" to canvas_config.json."}, 400)
+                return
+
+            try:
+                summary = _call_anthropic(api_key, assignment)
+                self._send_json({
+                    "ok":                 True,
+                    "title":              assignment.get("title",  ""),
+                    "course":             assignment.get("course", ""),
+                    "what_its_asking":    summary.get("what_its_asking",    ""),
+                    "concepts_tested":    summary.get("concepts_tested",    ""),
+                    "suggested_approach": summary.get("suggested_approach", ""),
+                })
+            except Exception as err:
+                self._send_json({"error": str(err)}, 500)
+
         else:
             self.send_response(404)
             self.end_headers()

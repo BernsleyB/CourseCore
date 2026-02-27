@@ -16,6 +16,13 @@ The user is a student at **Palm Beach State College** (Canvas instance: `https:/
 
 ---
 
+## Version Control
+
+- **Git:** Repository is initialized. Remote is at `https://github.com/BernsleyB/CourseCore`.
+- **Gitignored files:** `canvas_config.json` and `assignments.json` are excluded from version control for security. `canvas_config.json` contains a live Canvas API token and Bark device key; `assignments.json` contains personal academic data. Never commit either file.
+
+---
+
 ## Every File and What It Does
 
 ### `homework_tracker.py`
