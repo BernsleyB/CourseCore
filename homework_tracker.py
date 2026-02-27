@@ -7,11 +7,16 @@ Requires no extra software — only the Python that came with your Mac.
 
 import json
 import os
+import re
 import uuid
 import webbrowser
 import threading
 import socket
 import time
+import tempfile
+import shutil
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import date
 import datetime as _dt
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -43,8 +48,16 @@ def load_assignments():
 
 
 def save_assignments(assignments):
+    data = {}
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            data = {}
+    data["assignments"] = assignments
     with open(DATA_FILE, "w") as f:
-        json.dump({"assignments": assignments}, f, indent=2)
+        json.dump(data, f, indent=2)
 
 
 # ── Canvas sync helpers ────────────────────────────────────────────────────────
@@ -73,24 +86,45 @@ def start_canvas_sync():
 
 # ── Anthropic AI summarization ────────────────────────────────────────────────
 
-def _call_anthropic(api_key: str, assignment: dict) -> dict:
+def _call_anthropic(api_key: str, assignment: dict, announcements: list = None, file_texts: list = None) -> dict:
     """Call Anthropic API to summarize an assignment. Returns dict with three fields."""
-    title    = assignment.get("title",    "Unknown Assignment")
-    course   = assignment.get("course",   "Unknown Course")
-    due_date = assignment.get("due_date", "Unknown")
+    title       = assignment.get("title",       "Unknown Assignment")
+    course      = assignment.get("course",      "Unknown Course")
+    due_date    = assignment.get("due_date",    "Unknown")
+    description = (assignment.get("description") or "").strip()
 
     prompt = (
         "You are a helpful academic assistant for a nursing/science student at "
         "Palm Beach State College.\n\n"
         f"Assignment: {title}\n"
         f"Course: {course}\n"
-        f"Due Date: {due_date}\n\n"
-        "Based on the assignment title and course, respond with a JSON object "
+        f"Due Date: {due_date}\n"
+    )
+
+    if description:
+        prompt += f"\nAssignment Instructions:\n{description[:3000]}\n"
+
+    if announcements:
+        ann_lines = []
+        for a in announcements[:3]:
+            t   = a.get("title", "").strip()
+            msg = (a.get("message") or "").strip()[:500]
+            dt  = (a.get("posted_at") or "")[:10]
+            ann_lines.append(f"- [{dt}] {t}: {msg}" if dt else f"- {t}: {msg}")
+        prompt += "\nRecent Course Announcements:\n" + "\n".join(ann_lines) + "\n"
+
+    if file_texts:
+        prompt += "\nAttached Course Materials:\n"
+        for f in file_texts:
+            prompt += f"\n[File: {f['filename']}]\n{f['text']}\n"
+
+    prompt += (
+        "\nBased on all available context above, respond with a JSON object "
         "containing exactly these three keys:\n"
-        "- \"what_its_asking\": What this assignment is likely asking the student "
+        "- \"what_its_asking\": What this assignment is asking the student "
         "to do (1-3 sentences)\n"
         "- \"concepts_tested\": The academic concepts or skills this assignment "
-        "probably tests (1-3 sentences)\n"
+        "tests (1-3 sentences)\n"
         "- \"suggested_approach\": A practical suggested approach for completing "
         "this assignment (2-4 sentences)\n\n"
         "Respond with only valid JSON — no markdown fences, no extra text."
@@ -136,6 +170,150 @@ def _call_anthropic(api_key: str, assignment: dict) -> dict:
         except Exception:
             msg = body
         raise Exception(f"Anthropic API error ({e.code}): {msg}")
+
+
+# ── Canvas file extraction helpers ───────────────────────────────────────────
+
+def _extract_canvas_file_ids(html: str) -> list:
+    """Extract Canvas file IDs from assignment description HTML."""
+    if not html:
+        return []
+    ids = []
+    # data-api-endpoint="…/files/12345" (Canvas Rich Content API attribute)
+    for m in re.finditer(r'data-api-endpoint="[^"]*?/files/(\d+)"', html):
+        ids.append(int(m.group(1)))
+    # href="…/files/12345/" (direct download links)
+    for m in re.finditer(r'href="[^"]*?/files/(\d+)(?:/[^"]*?)?"', html):
+        fid = int(m.group(1))
+        if fid not in ids:
+            ids.append(fid)
+    return ids
+
+
+def _download_canvas_file(canvas_url: str, token: str, file_id: int, dest_dir: str):
+    """
+    Fetch file metadata from Canvas, then download the file to dest_dir.
+    Returns {"path": ..., "filename": ..., "content_type": ...} or None on error.
+    """
+    try:
+        meta_url = f"{canvas_url}/api/v1/files/{file_id}"
+        req = urllib.request.Request(
+            meta_url,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            meta = json.loads(resp.read())
+
+        filename     = meta.get("display_name", f"file_{file_id}")
+        download_url = meta.get("url", "")
+        content_type = meta.get("content-type", "")
+        size         = meta.get("size", 0)
+
+        if not download_url:
+            return None
+        if size > 10 * 1024 * 1024:   # skip files > 10 MB
+            return None
+
+        # S3 pre-signed URL — no auth header needed
+        dest_path = os.path.join(dest_dir, filename)
+        urllib.request.urlretrieve(download_url, dest_path)
+        return {"path": dest_path, "filename": filename, "content_type": content_type}
+
+    except Exception:
+        return None
+
+
+def _extract_pdf_text(path: str) -> str:
+    """Extract text from a PDF. Tries PyMuPDF first, falls back to raw scan."""
+    try:
+        import fitz  # PyMuPDF
+        doc  = fitz.open(path)
+        text = "\n".join(page.get_text() for page in doc)
+        doc.close()
+        return text[:5000]
+    except ImportError:
+        pass
+    except Exception:
+        return ""
+
+    # Fallback: scan raw bytes for PDF text operators
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        text_parts = []
+        for m in re.finditer(rb'\(([^)]{1,500})\)\s*Tj', raw):
+            try:
+                text_parts.append(m.group(1).decode("latin-1"))
+            except Exception:
+                pass
+        return " ".join(text_parts)[:5000]
+    except Exception:
+        return ""
+
+
+def _extract_docx_text(path: str) -> str:
+    """Extract text from a .docx file. Tries python-docx first, falls back to XML."""
+    try:
+        import docx
+        doc  = docx.Document(path)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        return text[:5000]
+    except ImportError:
+        pass
+    except Exception:
+        return ""
+
+    # Fallback: parse word/document.xml directly
+    try:
+        ns   = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        with zipfile.ZipFile(path, "r") as z:
+            xml_bytes = z.read("word/document.xml")
+        root  = ET.fromstring(xml_bytes)
+        texts = [el.text for el in root.iter(f"{{{ns}}}t") if el.text]
+        return " ".join(texts)[:5000]
+    except Exception:
+        return ""
+
+
+def _extract_pptx_text(path: str) -> str:
+    """Extract text from a .pptx file using stdlib only."""
+    try:
+        ns   = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        texts = []
+        with zipfile.ZipFile(path, "r") as z:
+            slide_names = sorted(
+                n for n in z.namelist()
+                if re.match(r"ppt/slides/slide\d+\.xml", n)
+            )
+            for sname in slide_names:
+                xml_bytes = z.read(sname)
+                root = ET.fromstring(xml_bytes)
+                for el in root.iter(f"{{{ns}}}t"):
+                    if el.text:
+                        texts.append(el.text)
+        return " ".join(texts)[:5000]
+    except Exception:
+        return ""
+
+
+def _extract_file_text(path: str, filename: str, content_type: str) -> str:
+    """Dispatcher: extract text from a downloaded file based on type."""
+    fn  = filename.lower()
+    ct  = content_type.lower()
+
+    if fn.endswith(".pdf") or "pdf" in ct:
+        return _extract_pdf_text(path)
+    if fn.endswith(".docx") or "word" in ct or "openxmlformats" in ct:
+        return _extract_docx_text(path)
+    if fn.endswith(".pptx") or "presentation" in ct:
+        return _extract_pptx_text(path)
+    if fn.endswith((".txt", ".md", ".csv")):
+        try:
+            with open(path, "r", errors="replace") as f:
+                return f.read(5000)
+        except Exception:
+            return ""
+    return ""
 
 
 # ── Embedded HTML/CSS/JS ──────────────────────────────────────────────────────
@@ -950,12 +1128,22 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as err:
                 self._send_json({"error": str(err)}, 400)
         elif path.startswith("/api/summarize/"):
-            aid        = path[len("/api/summarize/"):]
-            assignments = load_assignments()
-            assignment  = next((a for a in assignments if a["id"] == aid), None)
+            aid = path[len("/api/summarize/"):]
+            # Load full data to get assignments and announcements together
+            try:
+                with open(DATA_FILE, "r") as f:
+                    full_data = json.load(f)
+            except (IOError, json.JSONDecodeError):
+                full_data = {}
+            assignments      = full_data.get("assignments", [])
+            all_announcements = full_data.get("announcements", {})
+
+            assignment = next((a for a in assignments if a["id"] == aid), None)
             if assignment is None:
                 self._send_json({"error": "Assignment not found."}, 404)
                 return
+
+            course_announcements = all_announcements.get(assignment.get("course", ""), [])
 
             config_path = os.path.join(SCRIPT_DIR, "canvas_config.json")
             try:
@@ -974,8 +1162,31 @@ class Handler(BaseHTTPRequestHandler):
                               "Add \"anthropic_key\": \"<your-key>\" to canvas_config.json."}, 400)
                 return
 
+            canvas_url   = config.get("canvas_url", "").strip()
+            canvas_token = config.get("token", "").strip()
+
+            file_texts = []
+            description_html = assignment.get("description_html", "")
+            if description_html and canvas_url and canvas_token and assignment.get("canvas_id"):
+                tmp_dir = tempfile.mkdtemp()
+                try:
+                    file_ids = _extract_canvas_file_ids(description_html)
+                    for fid in file_ids[:5]:
+                        try:
+                            info = _download_canvas_file(canvas_url, canvas_token, fid, tmp_dir)
+                            if info:
+                                text = _extract_file_text(
+                                    info["path"], info["filename"], info["content_type"]
+                                )
+                                if text.strip():
+                                    file_texts.append({"filename": info["filename"], "text": text})
+                        except Exception:
+                            pass
+                finally:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+
             try:
-                summary = _call_anthropic(api_key, assignment)
+                summary = _call_anthropic(api_key, assignment, course_announcements, file_texts=file_texts)
                 self._send_json({
                     "ok":                 True,
                     "title":              assignment.get("title",  ""),

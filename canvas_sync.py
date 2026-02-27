@@ -24,6 +24,7 @@ How it works
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime, date
 from urllib.request import Request, urlopen
@@ -41,6 +42,19 @@ def _load_config():
     with open(CONFIG_FILE, "r") as f:
         cfg = json.load(f)
     return cfg["canvas_url"].rstrip("/"), cfg["token"]
+
+
+# ── HTML helpers ──────────────────────────────────────────────────────────────
+
+def _strip_html(html: str) -> str:
+    """Strip HTML tags and decode common entities to get plain text."""
+    if not html:
+        return ""
+    text = re.sub(r'<[^>]+>', ' ', html)
+    text = (text
+            .replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+            .replace('&nbsp;', ' ').replace('&quot;', '"').replace('&#39;', "'"))
+    return re.sub(r'\s+', ' ', text).strip()
 
 
 # ── Canvas HTTP helpers ───────────────────────────────────────────────────────
@@ -79,6 +93,31 @@ def _get_all(base_url: str, token: str, path: str) -> list:
     return results
 
 
+# ── Announcement helpers ──────────────────────────────────────────────────────
+
+def _fetch_course_announcements(base_url: str, token: str, course_id: int) -> list:
+    """Return the 3 most recent announcements for a course as plain-text dicts."""
+    try:
+        raw = _get_all(
+            base_url, token,
+            f"/api/v1/courses/{course_id}/discussion_topics"
+            f"?only_announcements=true"
+            f"&per_page=3"
+        )
+        announcements = []
+        for a in raw[:3]:
+            if not isinstance(a, dict):
+                continue
+            announcements.append({
+                "title":     a.get("title", "").strip(),
+                "message":   _strip_html(a.get("message") or ""),
+                "posted_at": (a.get("posted_at") or "")[:10],
+            })
+        return announcements
+    except RuntimeError:
+        return []
+
+
 # ── Date helpers ──────────────────────────────────────────────────────────────
 
 def _parse_due_date(due_at: str):
@@ -109,9 +148,19 @@ def _load_assignments() -> list:
         return []
 
 
-def _save_assignments(assignments: list) -> None:
+def _save_assignments(assignments: list, announcements=None) -> None:
+    data: dict = {}
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            data = {}
+    data["assignments"] = assignments
+    if announcements is not None:
+        data["announcements"] = announcements
     with open(DATA_FILE, "w") as f:
-        json.dump({"assignments": assignments}, f, indent=2)
+        json.dump(data, f, indent=2)
 
 
 # ── Main sync logic ───────────────────────────────────────────────────────────
@@ -179,10 +228,12 @@ def sync() -> dict:
             if due_date < today_str:
                 continue                  # skip anything already past
             canvas_upcoming.append({
-                "canvas_id": a["id"],
-                "title":     a.get("name", "Unnamed Assignment"),
-                "course":    cname,
-                "due_date":  due_date,
+                "canvas_id":        a["id"],
+                "title":            a.get("name", "Unnamed Assignment"),
+                "course":           cname,
+                "due_date":         due_date,
+                "description":      _strip_html(a.get("description") or ""),
+                "description_html": (a.get("description") or ""),
             })
 
         # Submitted (turned in but not yet graded)
@@ -238,14 +289,17 @@ def sync() -> dict:
         if cid in by_canvas_id:
             row = by_canvas_id[cid]
             changed = (
-                row.get("title")    != ca["title"]    or
-                row.get("course")   != ca["course"]   or
-                row.get("due_date") != ca["due_date"]
+                row.get("title")       != ca["title"]    or
+                row.get("course")      != ca["course"]   or
+                row.get("due_date")    != ca["due_date"] or
+                row.get("description") != ca.get("description", "")
             )
-            row["title"]    = ca["title"]
-            row["course"]   = ca["course"]
-            row["due_date"] = ca["due_date"]
-            row["source"]   = "canvas"
+            row["title"]            = ca["title"]
+            row["course"]           = ca["course"]
+            row["due_date"]         = ca["due_date"]
+            row["description"]      = ca.get("description", "")
+            row["description_html"] = ca.get("description_html", "")
+            row["source"]           = "canvas"
             # completed and notifications_sent are preserved (not touched)
             new_canvas_rows.append(row)
             if changed:
@@ -257,6 +311,8 @@ def sync() -> dict:
                 "title":              ca["title"],
                 "course":             ca["course"],
                 "due_date":           ca["due_date"],
+                "description":        ca.get("description", ""),
+                "description_html":   ca.get("description_html", ""),
                 "notifications_sent": [],
                 "source":             "canvas",
                 "completed":          False,
@@ -281,8 +337,15 @@ def sync() -> dict:
             # Past-due, not submitted, not completed — remove
             removed += 1
 
+    # ── 4. Fetch announcements per course ───────────────────────────────────────
+    course_announcements: dict[str, list] = {}
+    for cid, cname in course_map.items():
+        anns = _fetch_course_announcements(canvas_url, token, cid)
+        if anns:
+            course_announcements[cname] = anns
+
     # Final list: keep manual rows, replace canvas rows with fresh data
-    _save_assignments(manual + new_canvas_rows)
+    _save_assignments(manual + new_canvas_rows, course_announcements)
 
     return {
         "ok":             True,
