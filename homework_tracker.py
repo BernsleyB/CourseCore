@@ -23,13 +23,15 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 import urllib.request
 import urllib.error
+import base64
 
 
 # ── Paths & config ────────────────────────────────────────────────────────────
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE  = os.path.join(SCRIPT_DIR, "assignments.json")
-PORT       = 8765
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE    = os.path.join(SCRIPT_DIR, "assignments.json")
+SYLLABI_FILE = os.path.join(SCRIPT_DIR, "syllabi.json")
+PORT         = 8765
 
 # ── Canvas sync state ─────────────────────────────────────────────────────────
 _sync_state = {"last_sync": None, "result": None, "error": None, "running": False}
@@ -58,6 +60,27 @@ def save_assignments(assignments):
     data["assignments"] = assignments
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def load_syllabi() -> dict:
+    if not os.path.exists(SYLLABI_FILE):
+        return {}
+    try:
+        with open(SYLLABI_FILE, "r") as f:
+            return json.load(f).get("syllabi", {})
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def save_syllabi(syllabi: dict) -> None:
+    with open(SYLLABI_FILE, "w") as f:
+        json.dump({"syllabi": syllabi}, f, indent=2)
+
+
+def _slugify_course(course: str) -> str:
+    """URL-safe slug for a course name — used for DELETE routing."""
+    slug = re.sub(r'[^a-z0-9]+', '_', course.lower())
+    return slug.strip('_')
 
 
 # ── Canvas sync helpers ────────────────────────────────────────────────────────
@@ -172,6 +195,67 @@ def _call_anthropic(api_key: str, assignment: dict, announcements: list = None, 
         raise Exception(f"Anthropic API error ({e.code}): {msg}")
 
 
+def _call_anthropic_syllabus(api_key: str, course: str, pdf_text: str) -> dict:
+    """Call Anthropic API to extract structured syllabus data. Returns structured dict."""
+    _empty = {
+        "professor":   {"name": None, "email": None, "phone": None,
+                        "office_hours": None, "office_location": None},
+        "assignments": [],
+        "exams":       [],
+        "policies":    {"attendance": None, "late_work": None},
+        "schedule":    [],
+    }
+
+    prompt = (
+        f"Course: {course}\n"
+        f"Syllabus Text: {pdf_text[:8000]}\n\n"
+        "Respond with a single valid JSON object (no markdown fences):\n"
+        "{\n"
+        '  "professor": {"name":..., "email":..., "phone":..., "office_hours":..., "office_location":...},\n'
+        '  "assignments": [{"name":..., "weight":"25% or 100 pts", "description":...}],\n'
+        '  "exams": [{"name":..., "date":"YYYY-MM-DD or text as written", "topics":...}],\n'
+        '  "policies": {"attendance":"2-4 sentence summary or null", "late_work":"...or null"},\n'
+        '  "schedule": [{"week":"Week 1 (Jan 13)", "topics":"..."}]\n'
+        "}\n"
+        "Rules:\n"
+        "- assignments: ONLY graded items with weights (no readings)\n"
+        "- exams: ALL exams AND quizzes found anywhere in the syllabus\n"
+        "- schedule: [] if no weekly schedule found\n"
+        "- null for any field not present in the syllabus"
+    )
+
+    payload = json.dumps({
+        "model":      "claude-sonnet-4-20250514",
+        "max_tokens": 2048,
+        "messages":   [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload, method="POST",
+    )
+    req.add_header("Content-Type",      "application/json")
+    req.add_header("x-api-key",         api_key)
+    req.add_header("anthropic-version", "2023-06-01")
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+            text   = result["content"][0]["text"].strip()
+            if text.startswith("```"):
+                parts = text.split("```")
+                text = parts[1] if len(parts) > 1 else text
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return _empty
+    except Exception:
+        return _empty
+
+
 # ── Canvas file extraction helpers ───────────────────────────────────────────
 
 def _extract_canvas_file_ids(html: str) -> list:
@@ -223,14 +307,14 @@ def _download_canvas_file(canvas_url: str, token: str, file_id: int, dest_dir: s
         return None
 
 
-def _extract_pdf_text(path: str) -> str:
+def _extract_pdf_text(path: str, limit: int = 5000) -> str:
     """Extract text from a PDF. Tries PyMuPDF first, falls back to raw scan."""
     try:
         import fitz  # PyMuPDF
         doc  = fitz.open(path)
         text = "\n".join(page.get_text() for page in doc)
         doc.close()
-        return text[:5000]
+        return text[:limit]
     except ImportError:
         pass
     except Exception:
@@ -246,9 +330,226 @@ def _extract_pdf_text(path: str) -> str:
                 text_parts.append(m.group(1).decode("latin-1"))
             except Exception:
                 pass
-        return " ".join(text_parts)[:5000]
+        return " ".join(text_parts)[:limit]
     except Exception:
         return ""
+
+
+def _render_pdf_pages_coregraphics(pdf_path: str, max_pages: int, tmp_dir: str,
+                                    scale: float = 1.5) -> list:
+    """Render PDF pages to PNG files using macOS CoreGraphics (no pip required).
+    Returns list of file paths for successfully rendered pages."""
+    import ctypes
+    import ctypes.util
+
+    try:
+        cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+        cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+        ii = ctypes.CDLL('/System/Library/Frameworks/ImageIO.framework/ImageIO')
+
+        class CGRect(ctypes.Structure):
+            _fields_ = [('x', ctypes.c_double), ('y', ctypes.c_double),
+                        ('width', ctypes.c_double), ('height', ctypes.c_double)]
+
+        cf.CFURLCreateFromFileSystemRepresentation.restype  = ctypes.c_void_p
+        cf.CFURLCreateFromFileSystemRepresentation.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_ssize_t, ctypes.c_bool]
+        cf.CFStringCreateWithCString.restype  = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        cg.CGPDFDocumentCreateWithURL.restype  = ctypes.c_void_p
+        cg.CGPDFDocumentCreateWithURL.argtypes = [ctypes.c_void_p]
+        cg.CGPDFDocumentGetNumberOfPages.restype  = ctypes.c_size_t
+        cg.CGPDFDocumentGetNumberOfPages.argtypes = [ctypes.c_void_p]
+        cg.CGPDFDocumentGetPage.restype  = ctypes.c_void_p
+        cg.CGPDFDocumentGetPage.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        cg.CGPDFPageGetBoxRect.restype  = CGRect
+        cg.CGPDFPageGetBoxRect.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        cg.CGColorSpaceCreateDeviceRGB.restype  = ctypes.c_void_p
+        cg.CGColorSpaceCreateDeviceRGB.argtypes = []
+        cg.CGBitmapContextCreate.restype  = ctypes.c_void_p
+        cg.CGBitmapContextCreate.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_uint32]
+        cg.CGContextSetRGBFillColor.argtypes = [
+            ctypes.c_void_p, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double]
+        cg.CGContextFillRect.argtypes   = [ctypes.c_void_p, CGRect]
+        cg.CGContextScaleCTM.argtypes   = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double]
+        cg.CGContextDrawPDFPage.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cg.CGBitmapContextCreateImage.restype  = ctypes.c_void_p
+        cg.CGBitmapContextCreateImage.argtypes = [ctypes.c_void_p]
+
+        ii.CGImageDestinationCreateWithURL.restype  = ctypes.c_void_p
+        ii.CGImageDestinationCreateWithURL.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        ii.CGImageDestinationAddImage.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        ii.CGImageDestinationFinalize.restype  = ctypes.c_bool
+        ii.CGImageDestinationFinalize.argtypes = [ctypes.c_void_p]
+
+        p    = pdf_path.encode('utf-8')
+        url  = cf.CFURLCreateFromFileSystemRepresentation(None, p, len(p), False)
+        doc  = cg.CGPDFDocumentCreateWithURL(url)
+        cf.CFRelease(url)
+        if not doc:
+            return []
+
+        n_pages = min(int(cg.CGPDFDocumentGetNumberOfPages(doc)), max_pages)
+        cs      = cg.CGColorSpaceCreateDeviceRGB()
+        kpng    = cf.CFStringCreateWithCString(None, b'public.png', 0x08000100)
+        paths   = []
+
+        for pg in range(1, n_pages + 1):
+            page = cg.CGPDFDocumentGetPage(doc, pg)
+            if not page:
+                continue
+            rect = cg.CGPDFPageGetBoxRect(page, 1)  # kCGPDFMediaBox=1
+            w    = max(1, int(rect.width  * scale))
+            h    = max(1, int(rect.height * scale))
+
+            ctx  = cg.CGBitmapContextCreate(None, w, h, 8, w * 4, cs, 1)  # kCGImageAlphaLast=1
+            if not ctx:
+                continue
+
+            bg = CGRect(0, 0, w, h)
+            cg.CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0)
+            cg.CGContextFillRect(ctx, bg)
+            cg.CGContextScaleCTM(ctx, scale, scale)
+            cg.CGContextDrawPDFPage(ctx, page)
+
+            img = cg.CGBitmapContextCreateImage(ctx)
+            if not img:
+                continue
+
+            out_path  = os.path.join(tmp_dir, f'page_{pg}.png')
+            out_bytes = out_path.encode('utf-8')
+            ourl      = cf.CFURLCreateFromFileSystemRepresentation(
+                None, out_bytes, len(out_bytes), False)
+            dest = ii.CGImageDestinationCreateWithURL(ourl, kpng, 1, None)
+            ii.CGImageDestinationAddImage(dest, img, None)
+            ok = ii.CGImageDestinationFinalize(dest)
+            cf.CFRelease(ourl)
+
+            if ok and os.path.exists(out_path):
+                paths.append(out_path)
+
+        return paths
+
+    except Exception:
+        return []
+
+
+def _pdf_page_images(pdf_path: str, max_pages: int = 4) -> list:
+    """Return a list of (image_bytes, media_type) for up to max_pages pages.
+
+    Strategy 1: PyMuPDF (fitz) if installed — renders at 1.5× scale to PNG.
+    Strategy 2: macOS CoreGraphics via ctypes — stdlib-only, always available on Mac.
+    """
+    # ── Strategy 1: PyMuPDF ──────────────────────────────────────────────────
+    try:
+        import fitz  # noqa: PyMuPDF
+        doc    = fitz.open(pdf_path)
+        mat    = fitz.Matrix(1.5, 1.5)
+        images = []
+        for page in list(doc)[:max_pages]:
+            pix = page.get_pixmap(matrix=mat)
+            images.append((pix.tobytes('png'), 'image/png'))
+        doc.close()
+        if images:
+            return images
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # ── Strategy 2: CoreGraphics via ctypes ──────────────────────────────────
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        paths = _render_pdf_pages_coregraphics(pdf_path, max_pages, tmp_dir)
+        images = []
+        for p in paths:
+            with open(p, 'rb') as f:
+                images.append((f.read(), 'image/png'))
+        return images
+    except Exception:
+        return []
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _call_anthropic_syllabus_vision(api_key: str, course: str, page_images: list) -> dict:
+    """Extract structured syllabus data from page images using Claude vision API."""
+    _empty = {
+        "professor":   {"name": None, "email": None, "phone": None,
+                        "office_hours": None, "office_location": None},
+        "assignments": [],
+        "exams":       [],
+        "policies":    {"attendance": None, "late_work": None},
+        "schedule":    [],
+    }
+
+    content = []
+    for img_bytes, media_type in page_images:
+        content.append({
+            "type": "image",
+            "source": {
+                "type":       "base64",
+                "media_type": media_type,
+                "data":       base64.b64encode(img_bytes).decode('ascii'),
+            }
+        })
+
+    content.append({
+        "type": "text",
+        "text": (
+            f"The images above are pages from a course syllabus for: {course}\n\n"
+            "Extract the syllabus information and respond with a single valid JSON object "
+            "(no markdown fences):\n"
+            "{\n"
+            '  "professor": {"name":..., "email":..., "phone":..., "office_hours":..., "office_location":...},\n'
+            '  "assignments": [{"name":..., "weight":"25% or 100 pts", "description":...}],\n'
+            '  "exams": [{"name":..., "date":"YYYY-MM-DD or text as written", "topics":...}],\n'
+            '  "policies": {"attendance":"2-4 sentence summary or null", "late_work":"...or null"},\n'
+            '  "schedule": [{"week":"Week 1 (Jan 13)", "topics":"..."}]\n'
+            "}\n"
+            "Rules:\n"
+            "- assignments: ONLY graded items with weights (no readings)\n"
+            "- exams: ALL exams AND quizzes found anywhere in the syllabus\n"
+            "- schedule: [] if no weekly schedule found\n"
+            "- null for any field not present in the syllabus"
+        )
+    })
+
+    payload = json.dumps({
+        "model":      "claude-sonnet-4-20250514",
+        "max_tokens": 2048,
+        "messages":   [{"role": "user", "content": content}],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload, method="POST",
+    )
+    req.add_header("Content-Type",      "application/json")
+    req.add_header("x-api-key",         api_key)
+    req.add_header("anthropic-version", "2023-06-01")
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+            text   = result["content"][0]["text"].strip()
+            if text.startswith("```"):
+                parts = text.split("```")
+                text  = parts[1] if len(parts) > 1 else text
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return _empty
+    except Exception:
+        return _empty
 
 
 def _extract_docx_text(path: str) -> str:
@@ -651,6 +952,90 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: #fef2f2; color: #dc2626;
     border-radius: 8px; padding: 14px; font-size: 14px;
   }
+
+  /* ── Syllabi page ──────────────────────────────────────────────────────── */
+  .syl-card {
+    background: white; border: 1px solid #e2e8f0; border-radius: 10px;
+    margin: 0 16px 16px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  }
+  .syl-card-hdr {
+    background: #1e40af; color: white; padding: 12px 16px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .syl-card-title { font-size: 15px; font-weight: 700; margin-bottom: 2px; }
+  .syl-card-meta  { font-size: 12px; opacity: 0.75; }
+  .syl-body { padding: 16px; }
+  .syl-section { margin-bottom: 16px; }
+  .syl-section:last-child { margin-bottom: 0; }
+  .syl-section-hdr {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.07em; color: #4338ca; margin-bottom: 8px;
+  }
+  .syl-table {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+  }
+  .syl-table th {
+    text-align: left; padding: 5px 10px; background: #f1f5f9;
+    font-size: 11px; font-weight: 600; color: #64748b;
+    border-bottom: 1px solid #e2e8f0;
+  }
+  .syl-table td {
+    padding: 6px 10px; border-bottom: 1px solid #f1f5f9;
+    vertical-align: top; color: #1e293b;
+  }
+  .syl-table tr:last-child td { border-bottom: none; }
+  .syl-prof-grid {
+    display: grid; grid-template-columns: 110px 1fr;
+    gap: 4px 12px; font-size: 13px; background: #f8fafc;
+    border-radius: 8px; padding: 10px 14px;
+  }
+  .syl-prof-key { color: #64748b; font-weight: 500; }
+  .syl-prof-val { color: #1e293b; }
+  .syl-policy-text {
+    font-size: 14px; color: #1e293b; line-height: 1.6;
+    background: #f8fafc; border-radius: 8px; padding: 10px 14px;
+    border-left: 3px solid #c7d2fe; white-space: pre-wrap; word-break: break-word;
+    margin-bottom: 8px;
+  }
+  .btn-reupload {
+    background: transparent; border: 1px solid rgba(255,255,255,0.5);
+    color: white; padding: 4px 10px; border-radius: 6px;
+    font-size: 12px; font-weight: 600; cursor: pointer;
+    font-family: inherit; transition: background 0.15s; white-space: nowrap;
+  }
+  .btn-reupload:hover { background: rgba(255,255,255,0.15); }
+
+  /* ── Syllabus upload modal ─────────────────────────────────────────────── */
+  .syl-upload-modal {
+    background: white; border-radius: 14px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+    width: min(460px, 94vw); overflow: hidden;
+  }
+  .syl-upload-hdr {
+    background: #1e40af; color: white; padding: 16px 20px;
+    font-size: 17px; font-weight: 700;
+  }
+  .syl-upload-body { padding: 20px; }
+  .syl-upload-ftr {
+    display: flex; justify-content: flex-end; gap: 10px;
+    padding: 14px 20px; border-top: 1px solid #e2e8f0; background: #f8fafc;
+  }
+  .file-drop-zone {
+    border: 2px dashed #cbd5e1; border-radius: 8px;
+    padding: 20px; text-align: center; color: #64748b;
+    font-size: 14px; cursor: pointer; transition: all 0.15s;
+    background: #f8fafc; word-break: break-all;
+  }
+  .file-drop-zone:hover { border-color: #1e40af; color: #1e40af; background: #eff6ff; }
+  .syl-upload-status { margin-top: 10px; font-size: 13px; min-height: 0; }
+  .syl-upload-status.loading { color: #1e40af; }
+  .syl-upload-status.error   { color: #dc2626; }
+  .syl-upload-status.success { color: #16a34a; }
+  .syl-course-other {
+    margin-top: 8px; width: 100%; box-sizing: border-box;
+    padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 8px;
+    font-family: inherit; font-size: 14px; color: #1e293b;
+  }
 </style>
 </head>
 <body>
@@ -675,7 +1060,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <div class="tabs-bar" id="tabs-bar"></div>
 
-<div class="main">
+<div class="main" id="assignments-main">
   <div class="col-headers">
     <span></span>
     <span>Assignment</span>
@@ -689,6 +1074,35 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="empty"><h2>No assignments yet!</h2><p>Click '+ Add Assignment' to get started.</p></div>
   </div>
 
+</div>
+
+<!-- Syllabi page (hidden until Syllabi tab is active) -->
+<div id="syllabi-main" class="main" style="display:none">
+  <div id="syllabi-content"></div>
+</div>
+
+<!-- Syllabus Upload Modal -->
+<div class="overlay" id="syl-upload-overlay" onclick="sylUploadOverlayClick(event)">
+  <div class="syl-upload-modal">
+    <div class="syl-upload-hdr">Upload Syllabus PDF</div>
+    <div class="syl-upload-body">
+      <div class="field">
+        <label for="syl-course-sel">Course</label>
+        <select id="syl-course-sel" onchange="handleCourseSelChange()" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;font-family:inherit;font-size:14px;color:#1e293b;background:white;"></select>
+        <input type="text" id="syl-course-other" class="syl-course-other" placeholder="Enter course name" style="display:none">
+      </div>
+      <div class="field">
+        <label>Syllabus PDF</label>
+        <div class="file-drop-zone" id="file-drop-zone" onclick="document.getElementById('syl-file-input').click()">Click to select PDF</div>
+        <input type="file" id="syl-file-input" accept=".pdf" style="display:none" onchange="handleFileSelect(this)">
+      </div>
+      <div class="syl-upload-status" id="syl-upload-status"></div>
+    </div>
+    <div class="syl-upload-ftr">
+      <button class="btn-cancel" onclick="closeSylUploadModal()">Cancel</button>
+      <button class="btn-save" id="btn-syl-upload" onclick="doUploadSyllabus()">Upload &amp; Analyze</button>
+    </div>
+  </div>
 </div>
 
 <!-- Summary Modal -->
@@ -781,7 +1195,7 @@ function closeModal() {
 function overlayClick(e) { if (e.target.id === 'overlay') closeModal(); }
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { closeModal(); closeSummaryModal(); }
+  if (e.key === 'Escape') { closeModal(); closeSummaryModal(); closeSylUploadModal(); }
   if (e.key === 'Enter' && document.getElementById('overlay').classList.contains('open'))
     saveAssignment();
 });
@@ -831,6 +1245,10 @@ async function toggleComplete(id, currentlyDone) {
 
 // ── Tabs ───────────────────────────────────────────────────────────────────
 let activeTab = 'all';
+let _syllabiData    = {};
+let _syllabiCount   = 0;
+let _selectedSylFile = null;
+let _assignmentList  = [];
 
 function shortLabel(course) {
   return course
@@ -840,6 +1258,7 @@ function shortLabel(course) {
 }
 
 function buildTabs(list) {
+  _assignmentList = list;
   const active  = list.filter(a => !a.completed);
   const done    = list.filter(a =>  a.completed);
   const courses = [...new Set(active.map(a => a.course))].sort();
@@ -852,10 +1271,11 @@ function buildTabs(list) {
       title:   c,
       count:   active.filter(a => a.course === c).length
     })),
-    { id: 'completed', display: 'Completed', count: done.length },
+    { id: 'completed', display: 'Completed',   count: done.length },
+    { id: 'syllabi',   display: 'Syllabi',     count: _syllabiCount },
   ];
 
-  if (!tabs.some(t => t.id === activeTab)) activeTab = 'all';
+  if (activeTab !== 'syllabi' && !tabs.some(t => t.id === activeTab)) activeTab = 'all';
 
   const bar = document.getElementById('tabs-bar');
   bar.innerHTML = tabs.map(t =>
@@ -865,7 +1285,15 @@ function buildTabs(list) {
   bar.querySelectorAll('.tab').forEach(btn => {
     btn.addEventListener('click', () => {
       activeTab = btn.getAttribute('data-tab-id');
-      loadAssignments();
+      if (activeTab === 'syllabi') {
+        bar.querySelectorAll('.tab').forEach(b =>
+          b.classList.toggle('active', b.getAttribute('data-tab-id') === 'syllabi')
+        );
+        showPage('syllabi');
+      } else {
+        showPage('assignments');
+        loadAssignments();
+      }
     });
   });
 }
@@ -919,6 +1347,7 @@ async function loadAssignments() {
   const today = new Date(); today.setHours(0,0,0,0);
 
   buildTabs(list);
+  if (activeTab === 'syllabi') return;
 
   let toShow;
   if (activeTab === 'completed') {
@@ -946,6 +1375,229 @@ async function loadAssignments() {
   } else {
     box.innerHTML = toShow.map(a => renderRow(a, today)).join('');
   }
+}
+
+// ── Syllabi ─────────────────────────────────────────────────────────────────
+function showPage(page) {
+  const assignMain = document.getElementById('assignments-main');
+  const sylMain    = document.getElementById('syllabi-main');
+  if (page === 'syllabi') {
+    assignMain.style.display = 'none';
+    sylMain.style.display    = 'block';
+    loadSyllabi();
+  } else {
+    assignMain.style.display = 'block';
+    sylMain.style.display    = 'none';
+  }
+}
+
+async function loadSyllabi() {
+  try {
+    const resp = await fetch('/api/syllabi');
+    const data = await resp.json();
+    _syllabiData  = data.syllabi || {};
+    _syllabiCount = Object.keys(_syllabiData).length;
+    const badge = document.querySelector('[data-tab-id="syllabi"] .tab-count');
+    if (badge) badge.textContent = _syllabiCount;
+    renderSyllabiPage(_syllabiData);
+  } catch(e) {
+    document.getElementById('syllabi-content').innerHTML =
+      '<div class="empty"><p>Error loading syllabi.</p></div>';
+  }
+}
+
+function renderSyllabiPage(syllabi) {
+  const container = document.getElementById('syllabi-content');
+  const count = Object.keys(syllabi).length;
+  if (count === 0) {
+    container.innerHTML =
+      '<div class="empty"><h2>No syllabi yet</h2>' +
+      '<p>Upload a syllabus PDF to extract course information.</p>' +
+      '<button class="btn-add" onclick="openSylUploadModal()" style="margin-top:12px">+ Upload First Syllabus</button></div>';
+    return;
+  }
+  let html =
+    '<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px 8px;">' +
+    `<span style="font-size:13px;color:#64748b">${count} course${count !== 1 ? 's' : ''}</span>` +
+    '<button class="btn-add" onclick="openSylUploadModal()">+ Upload Syllabus</button></div>';
+  for (const [course, sdata] of Object.entries(syllabi)) {
+    html += renderSyllabus(course, sdata);
+  }
+  container.innerHTML = html;
+}
+
+function renderSyllabus(course, data) {
+  const prof = data.professor || {};
+  const uploadedDate = data.uploaded_at
+    ? new Date(data.uploaded_at).toLocaleDateString('en-US', {month:'short',day:'numeric',year:'numeric'})
+    : '';
+  const filename = data.filename || '';
+
+  let html = '<div class="syl-card">' +
+    '<div class="syl-card-hdr">' +
+    '<div><div class="syl-card-title">' + esc(shortLabel(course)) + '</div>' +
+    '<div class="syl-card-meta">' + (uploadedDate ? esc(uploadedDate) + ' &bull; ' : '') + esc(filename) + '</div></div>' +
+    '<button class="btn-reupload" onclick="openSylUploadModal(\'' + esc(course).replace(/'/g,'\\\'') + '\')">Re-upload</button>' +
+    '</div><div class="syl-body">';
+
+  // Professor
+  const profFields = [
+    ['Name', prof.name], ['Email', prof.email], ['Phone', prof.phone],
+    ['Office Hours', prof.office_hours], ['Location', prof.office_location],
+  ].filter(([,v]) => v);
+  if (profFields.length) {
+    html += '<div class="syl-section"><div class="syl-section-hdr">Professor</div>' +
+      '<div class="syl-prof-grid">';
+    for (const [label, value] of profFields) {
+      html += '<span class="syl-prof-key">' + esc(label) + '</span><span class="syl-prof-val">' + esc(value) + '</span>';
+    }
+    html += '</div></div>';
+  }
+
+  // Graded Assignments
+  const graded = data.graded_assignments || [];
+  if (graded.length) {
+    html += '<div class="syl-section"><div class="syl-section-hdr">Graded Assignments</div>' +
+      '<table class="syl-table"><thead><tr><th>Name</th><th>Weight</th><th>Description</th></tr></thead><tbody>';
+    for (const item of graded) {
+      html += '<tr><td>' + esc(item.name||'') + '</td><td>' + esc(item.weight||'') + '</td><td>' + esc(item.description||'') + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
+  // Exams & Quizzes
+  const exams = data.exams || [];
+  if (exams.length) {
+    html += '<div class="syl-section"><div class="syl-section-hdr">Exams &amp; Quizzes</div>' +
+      '<table class="syl-table"><thead><tr><th>Name</th><th>Date</th><th>Topics</th></tr></thead><tbody>';
+    for (const item of exams) {
+      html += '<tr><td>' + esc(item.name||'') + '</td><td>' + esc(item.date||'') + '</td><td>' + esc(item.topics||'') + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
+  // Policies
+  const policies = data.policies || {};
+  if (policies.attendance || policies.late_work) {
+    html += '<div class="syl-section"><div class="syl-section-hdr">Policies</div>';
+    if (policies.attendance) {
+      html += '<div class="summary-section-label" style="margin-top:8px">Attendance</div>' +
+        '<div class="syl-policy-text">' + esc(policies.attendance) + '</div>';
+    }
+    if (policies.late_work) {
+      html += '<div class="summary-section-label" style="margin-top:8px">Late Work</div>' +
+        '<div class="syl-policy-text">' + esc(policies.late_work) + '</div>';
+    }
+    html += '</div>';
+  }
+
+  // Schedule
+  const schedule = data.schedule || [];
+  if (schedule.length) {
+    html += '<div class="syl-section"><div class="syl-section-hdr">Schedule</div>' +
+      '<table class="syl-table"><thead><tr><th>Week</th><th>Topics</th></tr></thead><tbody>';
+    for (const item of schedule) {
+      html += '<tr><td>' + esc(String(item.week||'')) + '</td><td>' + esc(item.topics||'') + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
+  html += '</div></div>';
+  return html;
+}
+
+// ── Syllabus upload modal ────────────────────────────────────────────────────
+function openSylUploadModal(preselectedCourse) {
+  const sel = document.getElementById('syl-course-sel');
+  sel.innerHTML = '<option value="">-- Select Course --</option>';
+  const courses = [...new Set(_assignmentList.map(a => a.course))].sort();
+  for (const c of courses) {
+    const opt = new Option(shortLabel(c), c);
+    opt.title = c;
+    sel.add(opt);
+  }
+  const other = new Option('Other (type manually)', '__other__');
+  sel.add(other);
+
+  if (preselectedCourse) sel.value = preselectedCourse;
+
+  _selectedSylFile = null;
+  document.getElementById('file-drop-zone').textContent = 'Click to select PDF';
+  document.getElementById('syl-upload-status').innerHTML = '';
+  document.getElementById('syl-upload-status').className = 'syl-upload-status';
+  document.getElementById('syl-file-input').value = '';
+  document.getElementById('syl-course-other').style.display = 'none';
+  document.getElementById('btn-syl-upload').disabled = false;
+  document.getElementById('syl-upload-overlay').classList.add('open');
+}
+
+function closeSylUploadModal() {
+  document.getElementById('syl-upload-overlay').classList.remove('open');
+  _selectedSylFile = null;
+}
+
+function sylUploadOverlayClick(e) {
+  if (e.target.id === 'syl-upload-overlay') closeSylUploadModal();
+}
+
+function handleCourseSelChange() {
+  const sel = document.getElementById('syl-course-sel');
+  document.getElementById('syl-course-other').style.display =
+    sel.value === '__other__' ? 'block' : 'none';
+}
+
+function handleFileSelect(input) {
+  if (input.files && input.files[0]) {
+    _selectedSylFile = input.files[0];
+    document.getElementById('file-drop-zone').textContent = _selectedSylFile.name;
+  }
+}
+
+async function doUploadSyllabus() {
+  const sel = document.getElementById('syl-course-sel');
+  let course = sel.value;
+  if (course === '__other__') {
+    course = document.getElementById('syl-course-other').value.trim();
+  }
+  if (!course) { alert('Please select or enter a course name.'); return; }
+  if (!_selectedSylFile) { alert('Please select a PDF file.'); return; }
+
+  const status = document.getElementById('syl-upload-status');
+  status.className = 'syl-upload-status loading';
+  status.textContent = 'Uploading and analyzing\u2026 This may take a moment.';
+  document.getElementById('btn-syl-upload').disabled = true;
+
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    const base64 = e.target.result.split(',')[1];
+    try {
+      const resp = await fetch('/api/syllabi/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ course: course, filename: _selectedSylFile.name, pdf_base64: base64 })
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error) {
+        status.className = 'syl-upload-status error';
+        status.textContent = 'Error: ' + (data.error || 'Upload failed');
+        document.getElementById('btn-syl-upload').disabled = false;
+        return;
+      }
+      status.className = 'syl-upload-status success';
+      status.textContent = 'Syllabus analyzed successfully!';
+      setTimeout(() => { closeSylUploadModal(); loadSyllabi(); }, 800);
+    } catch(err) {
+      status.className = 'syl-upload-status error';
+      status.textContent = 'Network error: ' + err.message;
+      document.getElementById('btn-syl-upload').disabled = false;
+    }
+  };
+  reader.onerror = () => {
+    status.className = 'syl-upload-status error';
+    status.textContent = 'Error reading file.';
+    document.getElementById('btn-syl-upload').disabled = false;
+  };
+  reader.readAsDataURL(_selectedSylFile);
 }
 
 // ── Canvas Sync ─────────────────────────────────────────────────────────────
@@ -1056,6 +1708,13 @@ loadAssignments();
 pollSyncStatus();                        // kick off on page load
 setInterval(loadAssignments,  60000);    // refresh list every minute
 setInterval(pollSyncStatus,  300000);    // re-check Canvas status every 5 min
+
+// Prime the syllabi tab count on startup
+fetch('/api/syllabi').then(r=>r.json()).then(d=>{
+  _syllabiCount = Object.keys(d.syllabi||{}).length;
+  const t = document.querySelector('[data-tab-id="syllabi"] .tab-count');
+  if (t) t.textContent = _syllabiCount;
+}).catch(()=>{});
 </script>
 </body>
 </html>"""
@@ -1097,6 +1756,9 @@ class Handler(BaseHTTPRequestHandler):
                 "result":    _sync_state["result"],
                 "error":     _sync_state["error"],
             })
+
+        elif path == "/api/syllabi":
+            self._send_json({"syllabi": load_syllabi()})
 
         else:
             self.send_response(404)
@@ -1197,6 +1859,81 @@ class Handler(BaseHTTPRequestHandler):
                 })
             except Exception as err:
                 self._send_json({"error": str(err)}, 500)
+
+        elif path == "/api/syllabi/upload":
+            length  = int(self.headers.get("Content-Length", 0))
+            tmp_dir = None
+            try:
+                body     = json.loads(self.rfile.read(length))
+                course   = str(body.get("course",   "")).strip()
+                filename = str(body.get("filename", "file.pdf")).strip()
+                b64data  = str(body.get("pdf_base64", ""))
+
+                if not course:
+                    self._send_json({"error": "Course name is required."}, 400)
+                    return
+                if not b64data:
+                    self._send_json({"error": "No file data received."}, 400)
+                    return
+
+                # Strip data URL prefix if present (data:application/pdf;base64,...)
+                if "," in b64data:
+                    b64data = b64data.split(",", 1)[1]
+
+                config_path = os.path.join(SCRIPT_DIR, "canvas_config.json")
+                try:
+                    with open(config_path) as f:
+                        config = json.load(f)
+                except (IOError, json.JSONDecodeError):
+                    self._send_json(
+                        {"error": "canvas_config.json not found or invalid."}, 500)
+                    return
+
+                api_key = config.get("anthropic_key", "").strip()
+                if not api_key:
+                    self._send_json(
+                        {"error": "No Anthropic API key configured. "
+                                  "Add \"anthropic_key\": \"<your-key>\" to canvas_config.json."}, 400)
+                    return
+
+                pdf_bytes = base64.b64decode(b64data)
+                tmp_dir   = tempfile.mkdtemp()
+                pdf_path  = os.path.join(tmp_dir, filename)
+                with open(pdf_path, "wb") as f:
+                    f.write(pdf_bytes)
+
+                pdf_text = _extract_pdf_text(pdf_path, limit=15000)
+                if pdf_text.strip():
+                    extracted = _call_anthropic_syllabus(api_key, course, pdf_text)
+                else:
+                    # Scanned/image-only PDF — render pages and use Claude vision
+                    page_images = _pdf_page_images(pdf_path, max_pages=4)
+                    if not page_images:
+                        self._send_json(
+                            {"error": "Could not extract content from this PDF. "
+                                      "It may be a scanned PDF that could not be rendered."}, 400)
+                        return
+                    extracted = _call_anthropic_syllabus_vision(api_key, course, page_images)
+                record = {
+                    "course":      course,
+                    "filename":    filename,
+                    "uploaded_at": _dt.datetime.now().strftime("%Y-%m-%d %I:%M %p").lstrip("0"),
+                    "professor":   extracted.get("professor",   {}),
+                    "graded_assignments": extracted.get("assignments", []),
+                    "exams":       extracted.get("exams",       []),
+                    "policies":    extracted.get("policies",    {}),
+                    "schedule":    extracted.get("schedule",    []),
+                }
+                syllabi = load_syllabi()
+                syllabi[course] = record
+                save_syllabi(syllabi)
+                self._send_json({"ok": True, "course": course, "record": record})
+
+            except Exception as err:
+                self._send_json({"error": str(err)}, 500)
+            finally:
+                if tmp_dir:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
 
         else:
             self.send_response(404)
